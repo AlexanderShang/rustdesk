@@ -673,14 +673,14 @@ fn half_to_f32(bits: u16) -> f32 {
         if mant == 0 {
             sign
         } else {
-            let mut e = -1i32;
-            let mut m = mant;
-            while (m & 0x0400) == 0 {
-                m <<= 1;
-                e += 1;
+            let mut exponent_adjustment = -1i32;
+            let mut normalized_mantissa = mant;
+            while (normalized_mantissa & 0x0400) == 0 {
+                normalized_mantissa <<= 1;
+                exponent_adjustment += 1;
             }
-            m &= 0x03ff;
-            sign | (((127 - 15 - e) as u32) << 23) | (m << 13)
+            normalized_mantissa &= 0x03ff;
+            sign | (((127 - 15 - exponent_adjustment) as u32) << 23) | (normalized_mantissa << 13)
         }
     } else if exp == 0x1f {
         sign | 0x7f80_0000 | (mant << 13)
@@ -691,6 +691,8 @@ fn half_to_f32(bits: u16) -> f32 {
 }
 
 fn linear_to_srgb_u8(v: f32) -> u8 {
+    // Use simple Reinhard tone mapping before gamma encoding to preserve
+    // highlights when desktop duplication returns HDR linear values.
     let mapped = if v.is_finite() {
         (v / (1.0 + v)).clamp(0.0, 1.0)
     } else {
