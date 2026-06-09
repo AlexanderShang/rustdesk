@@ -7,6 +7,7 @@ use winapi::{
     shared::{
         dxgi::*,
         dxgi1_2::*,
+        dxgiformat::*,
         dxgitype::*,
         minwindef::{DWORD, FALSE, TRUE, UINT},
         ntdef::LONG,
@@ -58,6 +59,8 @@ pub struct Capturer {
     output_texture: bool,
     adapter_desc1: DXGI_ADAPTER_DESC1,
     rotate: Rotate,
+    frame_format: DXGI_FORMAT,
+    normalized: Vec<u8>,
 }
 
 impl Capturer {
@@ -174,6 +177,8 @@ impl Capturer {
             output_texture: false,
             adapter_desc1,
             rotate,
+            frame_format: desc.ModeDesc.Format,
+            normalized: Vec::new(),
         })
     }
 
@@ -426,6 +431,7 @@ impl Capturer {
                 } else {
                     self.unmap();
                     let r = self.load_frame(timeout)?;
+                    let bgra = self.normalize_to_bgra(r.0, r.1 as usize)?;
                     let rotate = match self.display.rotation() {
                         DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED => kRotate0,
                         DXGI_MODE_ROTATION_ROTATE90 => kRotate90,
@@ -439,12 +445,12 @@ impl Capturer {
                         }
                     };
                     if rotate == kRotate0 {
-                        slice::from_raw_parts(r.0, r.1 as usize * self.height)
+                        bgra
                     } else {
                         self.rotated.resize(self.width * self.height * 4, 0);
                         crate::common::ARGBRotate(
-                            r.0,
-                            r.1,
+                            bgra.as_ptr(),
+                            (self.width * 4) as i32,
                             self.rotated.as_mut_ptr(),
                             4 * self.width as i32,
                             if rotate == kRotate180 {
@@ -460,6 +466,62 @@ impl Capturer {
                             rotate,
                         );
                         &self.rotated[..]
+                    }
+                }
+
+                unsafe fn normalize_to_bgra<'a>(
+                    &'a mut self,
+                    src: *const u8,
+                    pitch: usize,
+                ) -> io::Result<&'a [u8]> {
+                    match self.frame_format {
+                        DXGI_FORMAT_B8G8R8A8_UNORM => Ok(slice::from_raw_parts(src, pitch * self.height)),
+                        DXGI_FORMAT_R10G10B10A2_UNORM => {
+                            self.normalized.resize(self.width * self.height * 4, 0);
+                            for y in 0..self.height {
+                                let row = src.add(y * pitch) as *const u32;
+                                let dst_row =
+                                    &mut self.normalized[y * self.width * 4..(y + 1) * self.width * 4];
+                                for x in 0..self.width {
+                                    let pixel = *row.add(x);
+                                    let r10 = pixel & 0x3ff;
+                                    let g10 = (pixel >> 10) & 0x3ff;
+                                    let b10 = (pixel >> 20) & 0x3ff;
+                                    let a2 = (pixel >> 30) & 0x3;
+                                    let off = x * 4;
+                                    dst_row[off] = ((b10 * 255 + 511) / 1023) as u8;
+                                    dst_row[off + 1] = ((g10 * 255 + 511) / 1023) as u8;
+                                    dst_row[off + 2] = ((r10 * 255 + 511) / 1023) as u8;
+                                    dst_row[off + 3] = ((a2 * 255 + 1) / 3) as u8;
+                                }
+                            }
+                            Ok(&self.normalized)
+                        }
+                        DXGI_FORMAT_R16G16B16A16_FLOAT => {
+                            self.normalized.resize(self.width * self.height * 4, 0);
+                            for y in 0..self.height {
+                                let row = src.add(y * pitch) as *const u16;
+                                let dst_row =
+                                    &mut self.normalized[y * self.width * 4..(y + 1) * self.width * 4];
+                                for x in 0..self.width {
+                                    let off_src = x * 4;
+                                    let r = half_to_f32(*row.add(off_src));
+                                    let g = half_to_f32(*row.add(off_src + 1));
+                                    let b = half_to_f32(*row.add(off_src + 2));
+                                    let a = half_to_f32(*row.add(off_src + 3)).clamp(0.0, 1.0);
+                                    let off = x * 4;
+                                    dst_row[off] = linear_to_srgb_u8(b);
+                                    dst_row[off + 1] = linear_to_srgb_u8(g);
+                                    dst_row[off + 2] = linear_to_srgb_u8(r);
+                                    dst_row[off + 3] = (a * 255.0 + 0.5) as u8;
+                                }
+                            }
+                            Ok(&self.normalized)
+                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!("Unsupported DXGI frame format: {}", self.frame_format),
+                        )),
                     }
                 }
             };
@@ -601,6 +663,41 @@ impl Drop for Capturer {
     fn drop(&mut self) {
         if !self.duplication.is_null() {
             self.unmap();
+        }
+
+        fn half_to_f32(bits: u16) -> f32 {
+            let sign = ((bits & 0x8000) as u32) << 16;
+            let exp = ((bits >> 10) & 0x1f) as i32;
+            let mant = (bits & 0x03ff) as u32;
+            let f_bits = if exp == 0 {
+                if mant == 0 {
+                    sign
+                } else {
+                    let mut e = -1i32;
+                    let mut m = mant;
+                    while (m & 0x0400) == 0 {
+                        m <<= 1;
+                        e += 1;
+                    }
+                    m &= 0x03ff;
+                    sign | (((127 - 15 - e) as u32) << 23) | (m << 13)
+                }
+            } else if exp == 0x1f {
+                sign | 0x7f80_0000 | (mant << 13)
+            } else {
+                sign | (((exp + 112) as u32) << 23) | (mant << 13)
+            };
+            f32::from_bits(f_bits)
+        }
+
+        fn linear_to_srgb_u8(v: f32) -> u8 {
+            let mapped = if v.is_finite() { (v / (1.0 + v)).clamp(0.0, 1.0) } else { 0.0 };
+            let srgb = if mapped <= 0.003_130_8 {
+                12.92 * mapped
+            } else {
+                1.055 * mapped.powf(1.0 / 2.4) - 0.055
+            };
+            (srgb * 255.0 + 0.5) as u8
         }
     }
 }
